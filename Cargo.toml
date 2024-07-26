@@ -1,0 +1,9 @@
+[package]
+name = "avy-render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ash = { version = "0.38.0", features = ["libloading"] }
+smithay-client-toolkit = { version = "=0.19.2" }
+wayland-backend = { version = "0.3.6", features = ["client_system"] }
