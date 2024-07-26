@@ -2,45 +2,32 @@ pub mod app;
 pub mod debugging;
 
 use std::{
-    borrow::BorrowMut,
-    cell::{Ref, RefCell, RefMut},
-    convert::identity,
     ffi::{c_void, CStr},
     marker::PhantomData,
     ops::ControlFlow,
     process::exit,
-    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
-    u64,
 };
 
 use app::App;
 use ash::{
     ext::debug_utils,
-    khr::{get_physical_device_properties2, surface, wayland_surface},
-    vk::{
-        self, ApplicationInfo, Handle, InstanceCreateInfo, QueueFlags, StructureType,
-        WaylandSurfaceCreateInfoKHR, API_VERSION_1_1, API_VERSION_1_3,
-    },
+    khr::{surface, wayland_surface},
+    vk::{self, ApplicationInfo, Handle, InstanceCreateInfo, API_VERSION_1_1},
 };
 use debugging::vulkan_debug_callback;
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_output, delegate_registry,
-    output::{OutputHandler, OutputState},
     reexports::{
         calloop::EventLoop,
         calloop_wayland_source::WaylandSource,
         client::{
             globals::registry_queue_init,
             protocol::{wl_display::WlDisplay, wl_surface::WlSurface},
-            Connection, EventQueue, Proxy, QueueHandle,
+            Connection, Proxy,
         },
     },
-    registry::{ProvidesRegistryState, RegistryState},
     shell::{
         wlr_layer::{Anchor, Layer},
-        xdg::XdgSurface,
         WaylandSurface,
     },
 };
@@ -53,6 +40,7 @@ const LAYER_NAMES_PTR: &[*const i8] = &[LAYER_NAMES[0].as_ptr()];
 const DEVICE_EXTENSION_NAMES: [&CStr; 1] = [c"VK_KHR_swapchain"];
 const DEVICE_EXTENSION_NAMES_PTR: &[*const i8] = &[DEVICE_EXTENSION_NAMES[0].as_ptr()];
 
+#[allow(unused)]
 struct SwapchainElement {
     command_buffer: ash::vk::CommandBuffer,
     image: ash::vk::Image,
@@ -140,7 +128,7 @@ impl SwapchainElement {
             command_buffer,
             ..
         } = *self;
-        device.destroy_fence(self.fence, None);
+        device.destroy_fence(fence, None);
         device.destroy_semaphore(end_semaphore, None);
         device.destroy_semaphore(start_semaphore, None);
         device.destroy_framebuffer(framebuffer, None);
@@ -319,10 +307,6 @@ impl<'a> AvySwapchain<'a> {
         self.elements.get(self.current_frame).unwrap()
     }
 
-    fn current_element_mut(&mut self) -> &mut SwapchainElement {
-        self.elements.get_mut(self.current_frame).unwrap()
-    }
-
     unsafe fn next_element(&mut self) -> ash::prelude::VkResult<ControlFlow<(), (usize, usize)>> {
         let device = self.device;
         let s_device = &self.s_device;
@@ -382,7 +366,6 @@ impl<'a> AvySwapchain<'a> {
 
         let (current, element) = (&self.elements[current], &self.elements[element]);
 
-
         self.device.begin_command_buffer(
             element.command_buffer,
             &ash::vk::CommandBufferBeginInfo::default()
@@ -441,21 +424,6 @@ impl<'a> AvySwapchain<'a> {
 
         Ok(ControlFlow::Continue(()))
     }
-}
-
-#[inline]
-fn version_as_string(v: u32) -> String {
-    let [maj, min, patch] = [
-        ash::vk::api_version_major(v),
-        ash::vk::api_version_minor(v),
-        ash::vk::api_version_patch(v),
-    ];
-
-    format!("{maj}.{min}.{patch}")
-}
-
-unsafe fn as_mut_void<'b, 'o: 'b, T: 'o>(t: &'b mut T) -> &'b mut c_void {
-    (t as *mut T as *mut c_void).as_mut().unwrap()
 }
 
 struct Debugger<'a> {
@@ -573,7 +541,6 @@ unsafe fn supports_all_layers(
 }
 
 unsafe fn create_device(
-    entry: &ash::Entry,
     instance: &ash::Instance,
     vk_surface_instance: &ash::khr::surface::Instance,
     surface: ash::vk::SurfaceKHR,
@@ -687,7 +654,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Making device!");
     let (device, queue_family_i, queue) = unsafe {
         create_device(
-            &entry,
             &instance,
             &khr_surface_instance,
             khr_surface,
@@ -733,7 +699,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 queue,
                 ash::vk::ClearValue {
                     color: vk::ClearColorValue {
-                        float32: [1.0, 0.0, 1.0, 1.0]
+                        float32: [1.0, 0.0, 1.0, 1.0],
                     },
                 },
                 &wl_surface,
