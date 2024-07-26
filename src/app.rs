@@ -1,15 +1,12 @@
+#![allow(unused)]
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
-    delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     reexports::client::{globals::GlobalList, Connection, QueueHandle},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
-    shell::{
-        wlr_layer::{LayerShell, LayerShellHandler},
-        xdg::{window::WindowHandler, XdgShell},
-    },
+    shell::wlr_layer::{LayerShell, LayerShellHandler},
     shm::{Shm, ShmHandler},
 };
 
