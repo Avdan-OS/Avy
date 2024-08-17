@@ -1,21 +1,24 @@
+#![feature(coroutine_trait, coroutines)]
 pub mod app;
-pub mod debugging;
 
+use core::ffi;
 use std::{
+    borrow::BorrowMut,
     ffi::{c_void, CStr},
     marker::PhantomData,
-    ops::ControlFlow,
+    ops::{ControlFlow, Coroutine},
+    pin::Pin,
     process::exit,
+    sync::Arc,
     time::Duration,
 };
 
 use app::App;
-use ash::{
-    ext::debug_utils,
-    khr::{surface, wayland_surface},
-    vk::{self, ApplicationInfo, Handle, InstanceCreateInfo, API_VERSION_1_1},
-};
-use debugging::vulkan_debug_callback;
+
+use ash::vk::Handle;
+use palette::{rgb::Rgb, FromColor, IntoColor, Mix, Srgb};
+use skia_bindings::SkPaint;
+use skia_safe::{gpu::vk::GetProcOf, Color, Color4f, Paint, Rect};
 use smithay_client_toolkit::{
     reexports::{
         calloop::EventLoop,
@@ -31,558 +34,75 @@ use smithay_client_toolkit::{
         WaylandSurface,
     },
 };
+use vulkano::{
+    device::{
+        physical::{PhysicalDevice, PhysicalDeviceType},
+        Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags,
+    },
+    image::{view::ImageView, ImageUsage},
+    instance::{
+        debug::{
+            DebugUtilsMessageSeverity, DebugUtilsMessengerCallback, DebugUtilsMessengerCreateInfo,
+            ValidationFeatureDisable, ValidationFeatureEnable,
+        },
+        Instance, InstanceCreateInfo, InstanceExtensions,
+    },
+    swapchain::{Swapchain, SwapchainCreateInfo, SwapchainPresentInfo},
+    sync::{self, GpuFuture},
+    Validated, Version, VulkanError, VulkanLibrary, VulkanObject,
+};
 
 const INIT_WIDTH: u32 = 1920;
 const INIT_HEIGHT: u32 = 60;
 
-const LAYER_NAMES: [&CStr; 1] = [c"VK_LAYER_KHRONOS_validation"];
-const LAYER_NAMES_PTR: &[*const i8] = &[LAYER_NAMES[0].as_ptr()];
-const DEVICE_EXTENSION_NAMES: [&CStr; 1] = [c"VK_KHR_swapchain"];
-const DEVICE_EXTENSION_NAMES_PTR: &[*const i8] = &[DEVICE_EXTENSION_NAMES[0].as_ptr()];
+type Lch = palette::Lch<palette::white_point::D65, f32>;
 
-#[allow(unused)]
-struct SwapchainElement {
-    command_buffer: ash::vk::CommandBuffer,
-    image: ash::vk::Image,
-    image_view: ash::vk::ImageView,
-    framebuffer: ash::vk::Framebuffer,
-    start_semaphore: ash::vk::Semaphore,
-    end_semaphore: ash::vk::Semaphore,
-    fence: ash::vk::Fence,
-    last_fence: ash::vk::Fence,
+fn color_changer(
+    colors: &[Lch],
+    transition: usize,
+) -> impl Coroutine<(), Yield = Lch, Return = ()> + '_ {
+    let first = colors.iter().cloned().cycle();
+    let second = colors.iter().cloned().cycle().skip(1);
+
+    let pairs = first.zip(second);
+    #[coroutine]
+    move || {
+        for (a, b) in pairs {
+            for i in 0..transition {
+                let ratio = i as f32 / transition as f32;
+                yield a.mix(b, ratio);
+            }
+        }
+    }
 }
 
-impl SwapchainElement {
-    unsafe fn new(
-        device: &ash::Device,
-        format: ash::vk::Format,
-        render_pass: ash::vk::RenderPass,
-        image: ash::vk::Image,
-        command_buf: ash::vk::CommandBuffer,
-        (width, height): (u32, u32),
-    ) -> ash::prelude::VkResult<Self> {
-        let image_view = device.create_image_view(
-            &ash::vk::ImageViewCreateInfo::default()
-                .view_type(ash::vk::ImageViewType::TYPE_2D)
-                .components(ash::vk::ComponentMapping {
-                    r: ash::vk::ComponentSwizzle::IDENTITY,
-                    g: ash::vk::ComponentSwizzle::IDENTITY,
-                    b: ash::vk::ComponentSwizzle::IDENTITY,
-                    a: ash::vk::ComponentSwizzle::IDENTITY,
+fn best_physical_device(
+    instance: Arc<Instance>,
+    surface: Arc<vulkano::swapchain::Surface>,
+    device_extensions: &DeviceExtensions,
+) -> (Arc<PhysicalDevice>, u32) {
+    instance
+        .enumerate_physical_devices()
+        .expect("could not enumerate devices")
+        .filter(|p| p.supported_extensions().contains(&device_extensions))
+        .filter_map(|p| {
+            p.queue_family_properties()
+                .iter()
+                .enumerate()
+                .position(|(i, q)| {
+                    q.queue_flags.contains(QueueFlags::GRAPHICS)
+                        && p.surface_support(i as u32, &surface).unwrap_or(false)
                 })
-                .subresource_range(
-                    ash::vk::ImageSubresourceRange::default()
-                        .base_mip_level(0)
-                        .level_count(1)
-                        .base_array_layer(0)
-                        .layer_count(1)
-                        .aspect_mask(ash::vk::ImageAspectFlags::COLOR),
-                )
-                .image(image)
-                .format(format),
-            None,
-        )?;
-
-        let framebuffer = device.create_framebuffer(
-            &ash::vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
-                .attachment_count(1)
-                .attachments(&[image_view])
-                .width(width)
-                .height(height)
-                .layers(1),
-            None,
-        )?;
-
-        let start_semaphore =
-            device.create_semaphore(&ash::vk::SemaphoreCreateInfo::default(), None)?;
-        let end_semaphore =
-            device.create_semaphore(&ash::vk::SemaphoreCreateInfo::default(), None)?;
-
-        let fence = device.create_fence(
-            &ash::vk::FenceCreateInfo::default().flags(ash::vk::FenceCreateFlags::SIGNALED),
-            None,
-        )?;
-
-        let last_fence = ash::vk::Fence::null();
-
-        Ok(Self {
-            command_buffer: command_buf,
-            image,
-            image_view,
-            framebuffer,
-            start_semaphore,
-            end_semaphore,
-            fence,
-            last_fence,
+                .map(|q| (p, q as u32))
         })
-    }
-
-    unsafe fn destroy(&mut self, device: &ash::Device, command_pool: ash::vk::CommandPool) {
-        let Self {
-            fence,
-            end_semaphore,
-            start_semaphore,
-            framebuffer,
-            image_view,
-            command_buffer,
-            ..
-        } = *self;
-        device.destroy_fence(fence, None);
-        device.destroy_semaphore(end_semaphore, None);
-        device.destroy_semaphore(start_semaphore, None);
-        device.destroy_framebuffer(framebuffer, None);
-        device.destroy_image_view(image_view, None);
-        device.free_command_buffers(command_pool, &[command_buffer]);
-    }
-}
-
-struct AvySwapchain<'a> {
-    instance: &'a ash::Instance,
-    physical_device: &'a ash::vk::PhysicalDevice,
-    device: &'a ash::Device,
-    s_device: ash::khr::swapchain::Device,
-    vk_surface_instance: &'a ash::khr::surface::Instance,
-    surface: &'a ash::vk::SurfaceKHR,
-    command_pool: &'a ash::vk::CommandPool,
-    swapchain: ash::vk::SwapchainKHR,
-    render_pass: ash::vk::RenderPass,
-    elements: Vec<SwapchainElement>,
-    current_frame: usize,
-    size: (u32, u32),
-}
-
-impl<'a> AvySwapchain<'a> {
-    unsafe fn new(
-        instance: &'a ash::Instance,
-        physical_device: &'a ash::vk::PhysicalDevice,
-        device: &'a ash::Device,
-        vk_surface_instance: &'a ash::khr::surface::Instance,
-        surface: &'a ash::vk::SurfaceKHR,
-        command_pool: &'a ash::vk::CommandPool,
-        (width, height): (u32, u32),
-    ) -> ash::prelude::VkResult<Self> {
-        let capabilities = vk_surface_instance
-            .get_physical_device_surface_capabilities(*physical_device, *surface)?;
-
-        let surface_formats =
-            vk_surface_instance.get_physical_device_surface_formats(*physical_device, *surface)?;
-
-        let ash::vk::SurfaceFormatKHR {
-            format,
-            color_space,
-        } = surface_formats
-            .iter()
-            .find(|format| format.format == ash::vk::Format::B8G8R8A8_UNORM)
-            .unwrap_or(surface_formats.first().unwrap());
-
-        let image_count = if (capabilities.min_image_count + 1) < capabilities.max_image_count {
-            capabilities.min_image_count + 1
-        } else {
-            capabilities.min_image_count
-        };
-
-        let s_device = ash::khr::swapchain::Device::new(instance, device);
-        let swapchain = s_device.create_swapchain(
-            &ash::vk::SwapchainCreateInfoKHR::default()
-                .surface(*surface)
-                .min_image_count(image_count)
-                .image_format(*format)
-                .image_color_space(*color_space)
-                .image_extent(ash::vk::Extent2D { width, height })
-                .image_array_layers(1)
-                .image_usage(ash::vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                .image_sharing_mode(ash::vk::SharingMode::EXCLUSIVE)
-                .pre_transform(capabilities.current_transform)
-                .composite_alpha(ash::vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED)
-                .present_mode(ash::vk::PresentModeKHR::MAILBOX)
-                .clipped(true),
-            None,
-        )?;
-
-        let attachment = ash::vk::AttachmentDescription::default()
-            .format(*format)
-            .samples(ash::vk::SampleCountFlags::TYPE_1)
-            .load_op(ash::vk::AttachmentLoadOp::CLEAR)
-            .store_op(ash::vk::AttachmentStoreOp::STORE)
-            .initial_layout(ash::vk::ImageLayout::UNDEFINED)
-            .final_layout(ash::vk::ImageLayout::PRESENT_SRC_KHR);
-
-        let attachment_refs = [ash::vk::AttachmentReference::default()
-            .attachment(0)
-            .layout(ash::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
-
-        let subpass = ash::vk::SubpassDescription::default()
-            .pipeline_bind_point(ash::vk::PipelineBindPoint::GRAPHICS)
-            .color_attachments(&attachment_refs);
-
-        let render_pass = device.create_render_pass(
-            &ash::vk::RenderPassCreateInfo::default()
-                .flags(ash::vk::RenderPassCreateFlags::empty())
-                .attachments(&[attachment])
-                .subpasses(&[subpass]),
-            None,
-        )?;
-
-        let images = s_device.get_swapchain_images(swapchain)?;
-
-        // Images (image) <-1:1-> Element { image, image_view, frame_buffer, start_semaphore, end_semaphore, fence }
-        let command_bufs = device.allocate_command_buffers(
-            &ash::vk::CommandBufferAllocateInfo::default()
-                .command_pool(*command_pool)
-                .command_buffer_count(images.len() as u32)
-                .level(ash::vk::CommandBufferLevel::PRIMARY),
-        )?;
-
-        let elements = images
-            .into_iter()
-            .zip(command_bufs)
-            .map(|(image, command_buf)| {
-                SwapchainElement::new(
-                    device,
-                    *format,
-                    render_pass,
-                    image,
-                    command_buf,
-                    (width, height),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(Self {
-            instance,
-            physical_device,
-            device,
-            s_device,
-            surface,
-            command_pool,
-            swapchain,
-            render_pass,
-            elements,
-            current_frame: 0,
-            size: (width, height),
-            vk_surface_instance,
+        .min_by_key(|(p, _)| match p.properties().device_type {
+            PhysicalDeviceType::DiscreteGpu => 0,
+            PhysicalDeviceType::IntegratedGpu => 1,
+            PhysicalDeviceType::VirtualGpu => 2,
+            PhysicalDeviceType::Cpu => 3,
+            _ => 4,
         })
-    }
-
-    unsafe fn destroy(&mut self) {
-        self.elements
-            .iter_mut()
-            .for_each(|el| el.destroy(self.device, *self.command_pool));
-
-        self.device.destroy_render_pass(self.render_pass, None);
-
-        self.s_device.destroy_swapchain(self.swapchain, None);
-    }
-
-    unsafe fn recreate(&mut self) -> ash::prelude::VkResult<()> {
-        self.device.device_wait_idle()?;
-        self.destroy();
-        *self = Self::new(
-            self.instance,
-            self.physical_device,
-            self.device,
-            self.vk_surface_instance,
-            self.surface,
-            self.command_pool,
-            self.size,
-        )?;
-
-        Ok(())
-    }
-
-    unsafe fn resize(
-        &mut self,
-        new_size: (u32, u32),
-        surface: &WlSurface,
-    ) -> ash::prelude::VkResult<()> {
-        self.size = new_size;
-        self.recreate()?;
-        surface.commit();
-
-        Ok(())
-    }
-
-    fn current_element(&self) -> &SwapchainElement {
-        self.elements.get(self.current_frame).unwrap()
-    }
-
-    unsafe fn next_element(&mut self) -> ash::prelude::VkResult<ControlFlow<(), (usize, usize)>> {
-        let device = self.device;
-        let s_device = &self.s_device;
-        let current = self.current_element();
-
-        device.wait_for_fences(&[current.fence], true, u64::MAX)?;
-
-        let image_index = match s_device.acquire_next_image(
-            self.swapchain,
-            u64::MAX,
-            current.start_semaphore,
-            ash::vk::Fence::null(),
-        ) {
-            Ok((idx, false)) => idx as usize,
-            Ok((_, true))
-            | Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR | ash::vk::Result::SUBOPTIMAL_KHR) => {
-                self.recreate()?;
-                return Ok(ControlFlow::Break(()));
-            }
-            Err(err) => return Err(err),
-        };
-
-        let element = (&self.elements[image_index] as *const SwapchainElement
-            as *mut SwapchainElement)
-            .as_mut()
-            .unwrap();
-
-        if !element.last_fence.is_null() {
-            device.wait_for_fences(&[element.last_fence], true, u64::MAX)?;
-        }
-
-        element.last_fence = current.fence;
-        self.device.reset_fences(&[current.fence])?;
-
-        Ok(ControlFlow::Continue((self.current_frame, image_index)))
-    }
-
-    unsafe fn fill_frame(
-        &mut self,
-        queue: ash::vk::Queue,
-        clear_value: ash::vk::ClearValue,
-        wl_surface: &WlSurface,
-        app: &mut App,
-    ) -> ash::prelude::VkResult<ControlFlow<(), ()>> {
-        if app.changed_size {
-            app.changed_size = false;
-            self.resize(app.size, wl_surface)?;
-            return Ok(ControlFlow::Break(()));
-        }
-
-        let (current, element) = match self.next_element()? {
-            ControlFlow::Continue(el) => el,
-            ControlFlow::Break(()) => return Ok(ControlFlow::Break(())),
-        };
-
-        let image_index = element as u32;
-
-        let (current, element) = (&self.elements[current], &self.elements[element]);
-
-        self.device.begin_command_buffer(
-            element.command_buffer,
-            &ash::vk::CommandBufferBeginInfo::default()
-                .flags(ash::vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )?;
-
-        self.device.cmd_begin_render_pass(
-            element.command_buffer,
-            &ash::vk::RenderPassBeginInfo::default()
-                .render_pass(self.render_pass)
-                .framebuffer(element.framebuffer)
-                .render_area(
-                    ash::vk::Rect2D::default()
-                        .offset(ash::vk::Offset2D::default().x(0).y(0))
-                        .extent(
-                            ash::vk::Extent2D::default()
-                                .width(self.size.0)
-                                .height(self.size.1),
-                        ),
-                )
-                .clear_values(&[clear_value]),
-            ash::vk::SubpassContents::INLINE,
-        );
-
-        self.device.cmd_end_render_pass(element.command_buffer);
-
-        self.device.end_command_buffer(element.command_buffer)?;
-
-        self.device.queue_submit(
-            queue,
-            &[ash::vk::SubmitInfo::default()
-                .wait_semaphores(&[current.start_semaphore])
-                .wait_dst_stage_mask(&[ash::vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
-                .command_buffers(&[element.command_buffer])
-                .signal_semaphores(&[current.end_semaphore])],
-            current.fence,
-        )?;
-
-        match self.s_device.queue_present(
-            queue,
-            &ash::vk::PresentInfoKHR::default()
-                .wait_semaphores(&[current.end_semaphore])
-                .swapchains(&[self.swapchain])
-                .image_indices(&[image_index]),
-        ) {
-            Ok(false) => (),
-            Err(ash::vk::Result::ERROR_OUT_OF_DATE_KHR | ash::vk::Result::SUBOPTIMAL_KHR)
-            | Ok(true) => {
-                self.recreate()?;
-                return Ok(ControlFlow::Break(()));
-            }
-            Err(err) => return Err(err),
-        };
-
-        self.current_frame = (self.current_frame + 1) % self.elements.len();
-
-        Ok(ControlFlow::Continue(()))
-    }
-}
-
-struct Debugger<'a> {
-    instance: debug_utils::Instance,
-    messenger: ash::vk::DebugUtilsMessengerEXT,
-    __marker: PhantomData<&'a ()>,
-}
-
-impl<'a> Debugger<'a> {
-    unsafe fn new<'entry: 'a>(
-        entry: &'entry ash::Entry,
-        instance: &'a ash::Instance,
-    ) -> ash::prelude::VkResult<Self> {
-        let instance = debug_utils::Instance::new(entry, instance);
-
-        let messenger = instance
-            .create_debug_utils_messenger(
-                &vk::DebugUtilsMessengerCreateInfoEXT::default()
-                    .message_severity(
-                        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
-                            | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                            | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
-                            | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE,
-                    )
-                    .message_type(
-                        vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                            | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-                            | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-                    )
-                    .pfn_user_callback(Some(vulkan_debug_callback)),
-                None,
-            )
-            .unwrap();
-
-        Ok(Self {
-            instance,
-            messenger,
-            __marker: PhantomData,
-        })
-    }
-
-    unsafe fn destroy(&mut self) {
-        self.instance
-            .destroy_debug_utils_messenger(self.messenger, None);
-    }
-}
-
-unsafe fn best_physical_device(instance: &ash::Instance) -> Option<ash::vk::PhysicalDevice> {
-    let devices = instance.enumerate_physical_devices().map_or_else(
-        |err| {
-            println!("Error whilst querying physical devices: {err:?}");
-            None
-        },
-        Some,
-    )?;
-
-    devices
-        .iter()
-        .max_by_key(|dev| {
-            let props = instance.get_physical_device_properties(**dev);
-            match props.device_type {
-                ash::vk::PhysicalDeviceType::OTHER => 1,
-                ash::vk::PhysicalDeviceType::INTEGRATED_GPU => 4,
-                ash::vk::PhysicalDeviceType::DISCRETE_GPU => 5,
-                ash::vk::PhysicalDeviceType::VIRTUAL_GPU => 3,
-                ash::vk::PhysicalDeviceType::CPU => 2,
-                _ => 0,
-            }
-        })
-        .copied()
-}
-
-unsafe fn init_vulkan_wayland<'a>(
-    entry: &ash::Entry,
-    instance: &ash::Instance,
-    wl_display: &'a WlDisplay,
-    wl_surface: &'a WlSurface,
-) -> ash::prelude::VkResult<(
-    ash::khr::surface::Instance,
-    ash::khr::wayland_surface::Instance,
-    ash::vk::SurfaceKHR,
-)> {
-    let vk_surface_instance = ash::khr::surface::Instance::new(entry, instance);
-    let vk_wl_instance = ash::khr::wayland_surface::Instance::new(entry, instance);
-
-    let create_info = ash::vk::WaylandSurfaceCreateInfoKHR::default()
-        .display(wl_display.id().as_ptr() as *mut c_void)
-        .surface(wl_surface.id().as_ptr() as *mut c_void);
-
-    println!("\tCreating KHR surface from wayland!");
-    println!("\t\twith wl_display: {wl_display:p}");
-    println!("\t\twith wl_surface: {wl_surface:p}");
-
-    vk_wl_instance
-        .create_wayland_surface(&create_info, None)
-        .map(|surface| (vk_surface_instance, vk_wl_instance, surface))
-}
-
-unsafe fn supports_all_layers(
-    instance: &ash::Instance,
-    physical_device: ash::vk::PhysicalDevice,
-) -> bool {
-    let layer_props = instance
-        .enumerate_device_layer_properties(physical_device)
-        .expect("Get layer properties of device");
-
-    let supported_layer_names = layer_props
-        .iter()
-        .map(|layer| layer.layer_name_as_c_str().unwrap())
-        .collect::<Vec<_>>();
-
-    LAYER_NAMES
-        .iter()
-        .all(|required_layer| supported_layer_names.contains(required_layer))
-}
-
-unsafe fn create_device(
-    instance: &ash::Instance,
-    vk_surface_instance: &ash::khr::surface::Instance,
-    surface: ash::vk::SurfaceKHR,
-    physical_device: ash::vk::PhysicalDevice,
-) -> Option<(ash::Device, u32, ash::vk::Queue)> {
-    // Get index of a surface-supporting queue family.
-    let queue_family_i = instance
-        .get_physical_device_queue_family_properties(physical_device)
-        .iter()
-        .enumerate()
-        .filter_map(|(i, queue_family)| {
-            let supports_surface = vk_surface_instance
-                .get_physical_device_surface_support(physical_device, i as u32, surface)
-                .unwrap();
-            (supports_surface
-                && queue_family
-                    .queue_flags
-                    .contains(ash::vk::QueueFlags::GRAPHICS))
-            .then_some(i as u32)
-        })
-        .next()?;
-
-    let device_queue_infos = [ash::vk::DeviceQueueCreateInfo::default()
-        .queue_family_index(queue_family_i)
-        .queue_priorities(&[1.0])];
-
-    let mut create_info = ash::vk::DeviceCreateInfo::default()
-        .queue_create_infos(&device_queue_infos)
-        .enabled_extension_names(DEVICE_EXTENSION_NAMES_PTR);
-
-    #[allow(deprecated)]
-    if supports_all_layers(instance, physical_device) {
-        create_info = create_info.enabled_layer_names(LAYER_NAMES_PTR);
-    }
-
-    let device = instance
-        .create_device(physical_device, &create_info, None)
-        .expect("Create Vulkan device");
-
-    let queue = device.get_device_queue(queue_family_i, 0);
-
-    Some((device, queue_family_i, queue))
+        .expect("no device available")
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -618,74 +138,173 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Init Vulkan...
-    let entry = unsafe { ash::Entry::load()? };
-    println!("Creating Vulkan instance...");
-    let instance = unsafe {
-        entry.create_instance(
-            &InstanceCreateInfo::default()
-                .application_info(
-                    &ApplicationInfo::default()
-                        .api_version(API_VERSION_1_1)
-                        .application_name(c"AvTest")
-                        .engine_name(c"Avy (Skia)"),
+    let instance = {
+        let lib = VulkanLibrary::new().expect("[Vulkan] No Vulkan library found.");
+        Instance::new(
+            lib.clone(),
+            InstanceCreateInfo {
+                application_name: Some("DEMO".to_string()),
+                application_version: Version::major_minor(0, 1),
+                engine_name: Some("Avy (Skia)".to_string()),
+                engine_version: Version::major_minor(0, 1),
+                max_api_version: Some(Version::major_minor(1, 3)),
+                enabled_extensions: InstanceExtensions {
+                    khr_surface: true,
+                    khr_wayland_surface: true,
+                    khr_get_surface_capabilities2: true,
+                    khr_get_physical_device_properties2: true,
+                    ext_debug_utils: false,
+                    ..InstanceExtensions::empty()
+                },
+                // debug_utils_messengers: vec![DebugUtilsMessengerCreateInfo::user_callback(
+                //     unsafe {
+                //         DebugUtilsMessengerCallback::new(|sev, ty, data| {
+                //             println!("[VULKAN] [{ty:?}] [{sev:?}] {}", data.message);
+
+                //             data.objects.for_each(|obj| {
+                //                 println!(
+                //                     "\t with {:?} @ {:p} {:?}",
+                //                     obj.object_type,
+                //                     obj.object_handle as *const i8,
+                //                     obj.object_name
+                //                 )
+                //             });
+                //         })
+                //     },
+                // )],
+                ..Default::default()
+            },
+        )
+    }?;
+
+    let khr_surface = unsafe {
+        vulkano::swapchain::Surface::from_wayland(
+            instance.clone(),
+            wl_display.id().as_ptr(),
+            wl_surface.id().as_ptr(),
+            None,
+        )
+    }?;
+
+    let device_extensions = DeviceExtensions {
+        khr_swapchain: true,
+        ..Default::default()
+    };
+
+    let (physical_device, queue_family_i) =
+        best_physical_device(instance.clone(), khr_surface.clone(), &device_extensions);
+
+    let (device, mut queues) = Device::new(
+        physical_device.clone(),
+        DeviceCreateInfo {
+            queue_create_infos: vec![QueueCreateInfo {
+                queue_family_index: queue_family_i,
+                ..Default::default()
+            }],
+            enabled_extensions: device_extensions,
+            ..Default::default()
+        },
+    )
+    .expect("failed to create device");
+
+    let queue = queues.next().unwrap();
+
+    let caps = physical_device
+        .surface_capabilities(&khr_surface, Default::default())
+        .expect("failed to get surface capabilities");
+
+    let (width, height) = app.size;
+    let (image_format, _) = physical_device
+        .surface_formats(&khr_surface, Default::default())
+        .into_iter()
+        .flatten()
+        .find(|(format, _)| &vulkano::format::Format::B8G8R8A8_UNORM == format)
+        .expect("Need to support B8G8R8A8 format!");
+
+    let (mut swapchain, mut images) = Swapchain::new(
+        device.clone(),
+        khr_surface.clone(),
+        SwapchainCreateInfo {
+            min_image_count: caps.min_image_count + 1,
+            image_format,
+            image_extent: [width, height],
+            image_usage: ImageUsage::COLOR_ATTACHMENT,
+            composite_alpha: vulkano::swapchain::CompositeAlpha::PreMultiplied,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut image_views: Vec<_> = images
+        .iter()
+        .cloned()
+        .map(ImageView::new_default)
+        .collect::<Result<_, _>>()?;
+
+    let instance_c = instance.clone();
+    let get_proc = |of: GetProcOf| unsafe {
+        println!("{:?}", of.name());
+        let res = match of {
+            skia_safe::gpu::vk::GetProcOf::Instance(raw_instance, name) => instance
+                .library()
+                .get_instance_proc_addr(ash::vk::Instance::from_raw(raw_instance as _), name),
+            skia_safe::gpu::vk::GetProcOf::Device(device, name) => {
+                (instance_c.fns().v1_0.get_device_proc_addr)(
+                    ash::vk::Device::from_raw(device as _),
+                    name,
                 )
-                .enabled_extension_names(&[
-                    debug_utils::NAME.as_ptr(),
-                    surface::NAME.as_ptr(),
-                    wayland_surface::NAME.as_ptr(),
-                ])
-                .enabled_layer_names(&LAYER_NAMES.map(CStr::as_ptr)),
-            None,
+            }
+        };
+
+        match res {
+            Some(f) => f as _,
+            None => core::ptr::null(),
+        }
+    };
+
+    let backend_context = unsafe {
+        skia_safe::gpu::vk::BackendContext::new(
+            instance.handle().as_raw() as _,
+            physical_device.handle().as_raw() as _,
+            device.handle().as_raw() as _,
+            (queue.handle().as_raw() as _, queue_family_i as _),
+            &get_proc,
         )
-    }?;
-    let mut debugger = unsafe { Debugger::new(&entry, &instance) }?;
+    };
 
-    println!("\tDone!");
-
-    println!("Selecting best physical device...");
-    let physical_device = unsafe { best_physical_device(&instance) }.unwrap_or_else(|| exit(1));
-    println!("\tDone");
-
-    println!("Integrating with Wayland...");
-    let (khr_surface_instance, _, khr_surface) =
-        unsafe { init_vulkan_wayland(&entry, &instance, &wl_display, &wl_surface) }?;
-    println!("\tDone!");
-
-    println!("Making device!");
-    let (device, queue_family_i, queue) = unsafe {
-        create_device(
-            &instance,
-            &khr_surface_instance,
-            khr_surface,
-            physical_device,
-        )
-    }
-    .expect("Create vulkan device");
-    println!("Created vulkan device!");
-
-    let command_pool = unsafe {
-        device.create_command_pool(
-            &ash::vk::CommandPoolCreateInfo::default()
-                .queue_family_index(queue_family_i)
-                .flags(ash::vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-            None,
-        )
-    }?;
-
-    let mut swapchain = unsafe {
-        AvySwapchain::new(
-            &instance,
-            &physical_device,
-            &device,
-            &khr_surface_instance,
-            &khr_surface,
-            &command_pool,
-            (INIT_WIDTH, INIT_HEIGHT),
-        )
-    }?;
+    let mut gr_context = skia_safe::gpu::direct_contexts::make_vulkan(&backend_context, None)
+        .expect("Error creating Skia Vulkan context.");
 
     let time = std::time::Instant::now();
     let mut frames = 0;
+
+    let (vk_format, color_type) = (
+        skia_safe::gpu::vk::Format::B8G8R8A8_UNORM,
+        skia_safe::ColorType::BGRA8888,
+    );
+
+    let alloc = skia_safe::gpu::vk::Alloc::default();
+
+    let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
+    let mut recreate_swapchain = false;
+
+    let fonts = skia_safe::FontMgr::new();
+    fonts.family_names().for_each(|a| println!("Font: {a}"));
+    let inter = fonts
+        .match_family_style("Inter", skia_safe::FontStyle::bold())
+        .expect("Inter bold");
+
+    let inter_50pt = skia_safe::Font::from_typeface(inter, Some(50.0));
+
+    let colors: [Lch; 4] = [
+        Lch::from_color(Srgb::new(66, 62, 59).into_linear()),
+        Lch::from_color(Srgb::new(255, 46, 0).into_linear()),
+        Lch::from_color(Srgb::new(254, 168, 47).into_linear()),
+        Lch::from_color(Srgb::new(84, 72, 200).into_linear()),
+    ];
+
+    let mut rainbow = color_changer(&colors, 60);
+    let mut rainbow = Pin::new(&mut rainbow);
 
     loop {
         event_loop.dispatch(Duration::from_millis(16), &mut app)?;
@@ -694,24 +313,138 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        let action = unsafe {
-            swapchain.fill_frame(
-                queue,
-                ash::vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [1.0, 0.0, 1.0, 1.0],
-                    },
-                },
-                &wl_surface,
-                &mut app,
-            )
-        }?;
+        if recreate_swapchain {
+            (swapchain, images) = {
+                let (swapchain, new_images) = swapchain
+                    .recreate(SwapchainCreateInfo {
+                        image_extent: [width, height],
+                        ..swapchain.create_info()
+                    })
+                    .map_err(|vke| format!("Error re-creating Vulkan swap chain: {vke}"))?;
 
-        match action {
-            ControlFlow::Continue(()) => (),
-            ControlFlow::Break(()) => continue,
+                image_views = images
+                    .iter()
+                    .cloned()
+                    .map(ImageView::new_default)
+                    .collect::<Result<_, _>>()?;
+
+                recreate_swapchain = false;
+
+                (swapchain, new_images)
+            }
         }
 
+        let (image_index, suboptimal, acquire_fut) =
+            match vulkano::swapchain::acquire_next_image(swapchain.clone(), None)
+                .map_err(Validated::unwrap)
+            {
+                Ok(r) => r,
+                Err(vulkano::VulkanError::OutOfDate) => {
+                    recreate_swapchain = true;
+                    continue;
+                }
+                Err(_) => panic!("Failed to acquire next image!"),
+            };
+
+        if suboptimal {
+            recreate_swapchain = true;
+        }
+
+        let extent = swapchain.image_extent();
+        let [width, height]: [i32; 2] =
+            extent.map(|a| a.try_into().expect("Invalid swapchain image height!"));
+
+        let image_view = image_views.get(image_index as usize).cloned().unwrap();
+        let image = image_view.image();
+
+        let image_info = unsafe {
+            skia_safe::gpu::vk::ImageInfo::new(
+                image.handle().as_raw() as _,
+                alloc,
+                skia_bindings::VkImageTiling::OPTIMAL,
+                skia_bindings::VkImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk_format,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+
+        let render_target = &skia_safe::gpu::backend_render_targets::make_vk(
+            (width as _, height as _),
+            &image_info,
+        );
+
+        let mut skia_surface = skia_safe::gpu::surfaces::wrap_backend_render_target(
+            &mut gr_context,
+            render_target,
+            skia_bindings::GrSurfaceOrigin::TopLeft,
+            color_type,
+            None,
+            None,
+        )
+        .expect("Error creating Skia Vulkan surface.");
+
+        let canvas = skia_surface.canvas();
+
+        canvas.clear(Color4f {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        });
+
+        let std::ops::CoroutineState::Yielded(color) = rainbow.as_mut().resume(()) else {
+            panic!("Why is it finished?");
+        };
+
+        let color: Rgb = color.into_color();
+        let (r, g, b) = color.into_format::<u8>().into_components();
+
+        let mut color = Paint::default();
+        color.set_color(skia_safe::Color::from_rgb(r, g, b));
+        color.set_anti_alias(true);
+
+        canvas.draw_circle((500, 50), 23.0, &color);
+        canvas.draw_text_align(
+            "Welcome to AvdanOS",
+            (1700, 50),
+            &inter_50pt,
+            &color,
+            skia_bindings::SkTextUtils_Align::Right,
+        );
+
+        drop(skia_surface);
+        // gr_context.flush_and_submit();
+        gr_context.flush_submit_and_sync_cpu();
+        println!("Drawing!");
+
+        let fut = previous_frame_end
+            .borrow_mut()
+            .take()
+            .unwrap()
+            .join(acquire_fut)
+            .then_swapchain_present(
+                queue.clone(),
+                SwapchainPresentInfo::swapchain_image_index(swapchain.clone(), image_index),
+            )
+            .then_signal_fence_and_flush();
+
+        match fut.map_err(Validated::unwrap) {
+            Ok(future) => {
+                previous_frame_end = Some(future.boxed());
+            }
+            Err(VulkanError::OutOfDate) => {
+                recreate_swapchain = true;
+                previous_frame_end = Some(sync::now(device.clone()).boxed());
+            }
+            Err(e) => {
+                eprintln!("{e:?}");
+                previous_frame_end = Some(sync::now(device.clone()).boxed());
+            }
+        }
         frames += 1;
     }
 
@@ -719,18 +452,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Average FPS: {:.2}",
         frames as f64 / time.elapsed().as_secs_f64()
     );
-
-    unsafe {
-        device.device_wait_idle()?;
-        swapchain.destroy();
-        device.destroy_command_pool(command_pool, None);
-        device.destroy_device(None);
-        khr_surface_instance.destroy_surface(khr_surface, None);
-        debugger.destroy();
-
-        drop(wl_surface);
-        drop(wl_display);
-    }
 
     Ok(())
 }

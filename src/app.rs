@@ -20,6 +20,7 @@ pub struct App {
     pub running: bool,
     pub size: (u32, u32),
     pub changed_size: bool,
+    pub first_configure: bool,
 }
 
 impl App {
@@ -37,6 +38,7 @@ impl App {
             running: true,
             size,
             changed_size: false,
+            first_configure: true,
         })
     }
 }
@@ -161,5 +163,10 @@ impl LayerShellHandler for App {
         println!("WAYLAND:LayerShell: {configure:?}");
         self.size = configure.new_size;
         self.changed_size = true;
+
+        if self.first_configure {
+            // Draw frame here!
+            self.first_configure = false;
+        }
     }
 }
