@@ -32,7 +32,7 @@ use smithay_client_toolkit::{
         },
     },
     shell::{
-        wlr_layer::{Anchor, Layer},
+        wlr_layer::{Anchor, KeyboardInteractivity, Layer},
         WaylandSurface,
     },
 };
@@ -126,6 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     layer.set_anchor(Anchor::BOTTOM);
     layer.set_size(INIT_WIDTH, INIT_HEIGHT);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
     layer.commit();
 
     event_queue.roundtrip(&mut app).unwrap();
@@ -311,8 +312,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .match_family_style("Inter", skia_safe::FontStyle::bold())
         .expect("Inter bold");
 
-    let inter_50pt = skia_safe::Font::from_typeface(inter, Some(30.0));
-
     let colors: [Lch; 4] = [
         Lch::from_color(Srgb::new(66, 62, 59).into_linear()),
         Lch::from_color(Srgb::new(255, 46, 0).into_linear()),
@@ -324,7 +323,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rainbow = Pin::new(&mut rainbow);
 
     loop {
-        event_loop.dispatch(Duration::from_millis(16), &mut app)?;
+        event_loop.dispatch(Duration::from_millis(4), &mut app)?;
 
         if time.elapsed() > Duration::from_secs(10) {
             break;
@@ -378,8 +377,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if suboptimal {
             recreate_swapchain = true;
         }
-
-        println!("Physical dimensions: ({width}, {height})");
 
         let image_view = image_views.get(image_index as usize).cloned().unwrap();
         let image = image_view.image();
@@ -441,6 +438,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         color.set_anti_alias(true);
 
         canvas.draw_circle((500, 50), 23.0, &color);
+        let inter_50pt = skia_safe::Font::from_typeface(inter.clone(), Some(50.0));
+
         canvas.draw_text_align(
             "Welcome to AvdanOS",
             (1700, 50),
