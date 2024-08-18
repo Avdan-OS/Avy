@@ -3,11 +3,22 @@ use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
     output::{OutputHandler, OutputState},
-    reexports::client::{globals::GlobalList, Connection, QueueHandle},
+    reexports::{
+        client::{globals::GlobalList, protocol::wl_surface::WlSurface, Connection, QueueHandle},
+        protocols::wp::viewporter::client::wp_viewport::WpViewport,
+    },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     shell::wlr_layer::{LayerShell, LayerShellHandler},
     shm::{Shm, ShmHandler},
+};
+
+use crate::{
+    delegate_fractional_scale, delegate_viewporter,
+    protocols::{
+        fractional_scale::{FractionalScaleHandler, FractionalScaleManager, ScaleFactor},
+        viewporter::{Viewport, Viewporter},
+    },
 };
 
 pub struct App {
@@ -16,18 +27,22 @@ pub struct App {
     pub output_state: OutputState,
     pub shm_state: Shm,
     pub layer_state: LayerShell,
+    pub fractional_scale: FractionalScaleManager,
+    pub viewporter: Viewporter,
 
     pub running: bool,
-    pub size: (u32, u32),
+    pub logical_size: (u32, u32),
     pub changed_size: bool,
     pub first_configure: bool,
+    pub viewport: Option<WpViewport>,
+    pub scale_factor: Option<ScaleFactor>,
 }
 
 impl App {
     pub fn new(
         global_list: &GlobalList,
         queue_handle: &QueueHandle<Self>,
-        size: (u32, u32),
+        logical_size: (u32, u32),
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             registry_state: RegistryState::new(global_list),
@@ -35,10 +50,15 @@ impl App {
             output_state: OutputState::new(global_list, queue_handle),
             shm_state: Shm::bind(global_list, queue_handle)?,
             layer_state: LayerShell::bind(global_list, queue_handle)?,
+            fractional_scale: FractionalScaleManager::new(global_list, queue_handle)?,
+            viewporter: Viewporter::new(global_list, queue_handle)?,
+
             running: true,
-            size,
+            logical_size,
             changed_size: false,
             first_configure: true,
+            scale_factor: None,
+            viewport: None,
         })
     }
 }
@@ -64,7 +84,7 @@ impl CompositorHandler for App {
         &mut self,
         conn: &Connection,
         qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        surface: &WlSurface,
         new_factor: i32,
     ) {
     }
@@ -73,7 +93,7 @@ impl CompositorHandler for App {
         &mut self,
         conn: &Connection,
         qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        surface: &WlSurface,
         new_transform: smithay_client_toolkit::reexports::client::protocol::wl_output::Transform,
     ) {
     }
@@ -82,7 +102,7 @@ impl CompositorHandler for App {
         &mut self,
         conn: &Connection,
         qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        surface: &WlSurface,
         time: u32,
     ) {
         println!("WAYLAND@Compositor: Frame requested!");
@@ -92,7 +112,7 @@ impl CompositorHandler for App {
         &mut self,
         conn: &Connection,
         qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        surface: &WlSurface,
         output: &smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
     ) {
     }
@@ -101,7 +121,7 @@ impl CompositorHandler for App {
         &mut self,
         conn: &Connection,
         qh: &smithay_client_toolkit::reexports::client::QueueHandle<Self>,
-        surface: &smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface,
+        surface: &WlSurface,
         output: &smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput,
     ) {
     }
@@ -161,7 +181,7 @@ impl LayerShellHandler for App {
         serial: u32,
     ) {
         println!("WAYLAND:LayerShell: {configure:?}");
-        self.size = configure.new_size;
+        self.logical_size = configure.new_size;
         self.changed_size = true;
 
         if self.first_configure {
@@ -170,3 +190,31 @@ impl LayerShellHandler for App {
         }
     }
 }
+
+delegate_fractional_scale!(App);
+
+impl FractionalScaleHandler for App {
+    fn scale_factor_changed(
+        &mut self,
+        connection: &smithay_client_toolkit::reexports::client::Connection,
+        qh: &QueueHandle<Self>,
+        surface: &WlSurface,
+        factor: ScaleFactor,
+    ) {
+        println!("New scale factor: {factor:?}");
+        self.scale_factor.replace(factor);
+        self.changed_size = true;
+        if let Some(viewport) = &self.viewport {
+            // Change the source buffer.
+            viewport.set_source(
+                0.0,
+                0.0,
+                factor.scale(self.logical_size.0),
+                factor.scale(self.logical_size.1),
+            );
+            viewport.set_destination(self.logical_size.0 as i32, self.logical_size.1 as i32);
+        }
+    }
+}
+
+delegate_viewporter!(App);

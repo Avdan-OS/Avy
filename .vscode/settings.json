@@ -8,6 +8,7 @@
         "subresource",
         "swapchain",
         "swapchains",
+        "viewporter",
         "Vulkan"
     ]
 }

@@ -1,5 +1,7 @@
 #![feature(coroutine_trait, coroutines)]
 pub mod app;
+pub mod protocols;
+pub mod util;
 
 use core::ffi;
 use std::{
@@ -129,6 +131,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_queue.roundtrip(&mut app).unwrap();
     wl_surface.commit();
 
+    // Utilize fractional scaling.
+    app.fractional_scale.fractional_scaling(&wl_surface, &qh);
+
+    // Initialize viewport.
+    let wp_viewport = app.viewporter.get_viewport(&wl_surface, &qh);
+    app.viewport.replace(wp_viewport);
+
     let mut event_loop = EventLoop::<App>::try_new()?;
     WaylandSource::new(conn, event_queue).insert(event_loop.handle())?;
 
@@ -213,13 +222,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .surface_capabilities(&khr_surface, Default::default())
         .expect("failed to get surface capabilities");
 
-    let (width, height) = app.size;
     let (image_format, _) = physical_device
         .surface_formats(&khr_surface, Default::default())
         .into_iter()
         .flatten()
         .find(|(format, _)| &vulkano::format::Format::B8G8R8A8_UNORM == format)
         .expect("Need to support B8G8R8A8 format!");
+
+    let (width, height) = {
+        let (w, h) = app.logical_size;
+        if let Some(scale) = &app.scale_factor {
+            (scale.scale(w) as u32, scale.scale(h) as u32)
+        } else {
+            (w, h)
+        }
+    };
 
     let (mut swapchain, mut images) = Swapchain::new(
         device.clone(),
@@ -294,7 +311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .match_family_style("Inter", skia_safe::FontStyle::bold())
         .expect("Inter bold");
 
-    let inter_50pt = skia_safe::Font::from_typeface(inter, Some(50.0));
+    let inter_50pt = skia_safe::Font::from_typeface(inter, Some(30.0));
 
     let colors: [Lch; 4] = [
         Lch::from_color(Srgb::new(66, 62, 59).into_linear()),
@@ -313,25 +330,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        if recreate_swapchain {
-            (swapchain, images) = {
-                let (swapchain, new_images) = swapchain
-                    .recreate(SwapchainCreateInfo {
-                        image_extent: [width, height],
-                        ..swapchain.create_info()
-                    })
-                    .map_err(|vke| format!("Error re-creating Vulkan swap chain: {vke}"))?;
+        if app.changed_size {
+            recreate_swapchain = true;
+            app.changed_size = false;
+        }
 
-                image_views = images
-                    .iter()
-                    .cloned()
-                    .map(ImageView::new_default)
-                    .collect::<Result<_, _>>()?;
-
-                recreate_swapchain = false;
-
-                (swapchain, new_images)
+        let (width, height) = {
+            let (w, h) = app.logical_size;
+            if let Some(scale) = &app.scale_factor {
+                (scale.scale(w) as u32, scale.scale(h) as u32)
+            } else {
+                (w, h)
             }
+        };
+        if recreate_swapchain {
+            let (new_swapchain, new_images) = swapchain
+                .recreate(SwapchainCreateInfo {
+                    image_extent: [width, height],
+                    ..swapchain.create_info()
+                })
+                .map_err(|vke| format!("Error re-creating Vulkan swap chain: {vke}"))?;
+
+            image_views = new_images
+                .iter()
+                .cloned()
+                .map(ImageView::new_default)
+                .collect::<Result<_, _>>()?;
+
+            recreate_swapchain = false;
+
+            swapchain = new_swapchain;
+            images = new_images;
         }
 
         let (image_index, suboptimal, acquire_fut) =
@@ -350,9 +379,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             recreate_swapchain = true;
         }
 
-        let extent = swapchain.image_extent();
-        let [width, height]: [i32; 2] =
-            extent.map(|a| a.try_into().expect("Invalid swapchain image height!"));
+        println!("Physical dimensions: ({width}, {height})");
 
         let image_view = image_views.get(image_index as usize).cloned().unwrap();
         let image = image_view.image();
@@ -388,6 +415,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("Error creating Skia Vulkan surface.");
 
         let canvas = skia_surface.canvas();
+
+        // Apply scaling transform to Skia canvas.
+        if let Some(scale) = &app.scale_factor {
+            let factor = scale.as_f64() as f32;
+            canvas.scale((factor, factor));
+        }
 
         canvas.clear(Color4f {
             r: 1.0,
