@@ -4,7 +4,10 @@
 * Uses the omnipresent [Skia](https://skia.org) for graphics.
 * Supports fractional scaling for HiDPI screens
 
-https://github.com/user-attachments/assets/b0c58fef-a8c9-46af-9390-51aeb1b92524
+Here's a text shader demo. [(Shader by @notargs)](https://x.com/notargs/status/1250468645030858753) on X.
+
+https://github.com/user-attachments/assets/21709f24-1e41-4058-a911-7570bc5702a5
+
 
 * Heavily based on the work of [Amini Allight](https://gitlab.com/amini-allight/wayland-vulkan-example), thank you!
 * Implements most of the boilerplate necessary to get off the ground and use the [VK_KHR_wayland_surface](https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VK_KHR_wayland_surface.html) Vulkan extension.
