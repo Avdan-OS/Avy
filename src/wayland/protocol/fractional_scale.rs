@@ -1,7 +1,4 @@
-use std::{convert::Infallible, marker::PhantomData};
-
 use smithay_client_toolkit::{
-    delegate_activation,
     globals::GlobalData,
     reexports::{
         client::{
@@ -128,9 +125,9 @@ macro_rules! delegate_fractional_scale {
     ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
         smithay_client_toolkit::reexports::client::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
             smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1: smithay_client_toolkit::globals::GlobalData
-        ] => $crate::protocols::fractional_scale::FractionalScaleManager);
+        ] => $crate::wayland::protocol::fractional_scale::FractionalScaleManager);
         smithay_client_toolkit::reexports::client::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1: $crate::protocols::fractional_scale::FractionalScale
-        ] => $crate::protocols::fractional_scale::FractionalScale);
+            smithay_client_toolkit::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1: $crate::wayland::protocol::fractional_scale::FractionalScale
+        ] => $crate::wayland::protocol::fractional_scale::FractionalScale);
     };
 }
