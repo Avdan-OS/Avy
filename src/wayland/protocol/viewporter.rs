@@ -53,6 +53,7 @@ where
 }
 
 pub struct Viewport {
+    #[allow(unused)]
     surface: WlSurface,
 }
 
@@ -77,9 +78,9 @@ macro_rules! delegate_viewporter {
     ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
         smithay_client_toolkit::reexports::client::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
             smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewporter::WpViewporter: smithay_client_toolkit::globals::GlobalData
-        ] => $crate::protocols::viewporter::Viewporter);
+        ] => $crate::wayland::protocol::viewporter::Viewporter);
         smithay_client_toolkit::reexports::client::delegate_dispatch!($(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)? $ty: [
-            smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport: $crate::protocols::viewporter::Viewport
-        ] => $crate::protocols::viewporter::Viewport);
+            smithay_client_toolkit::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport: $crate::wayland::protocol::viewporter::Viewport
+        ] => $crate::wayland::protocol::viewporter::Viewport);
     };
 }

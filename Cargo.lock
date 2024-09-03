@@ -63,6 +63,7 @@ dependencies = [
  "skia-bindings",
  "skia-safe",
  "smithay-client-toolkit",
+ "thiserror",
  "vulkano",
  "wayland-backend",
 ]
